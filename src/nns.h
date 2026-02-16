@@ -39,6 +39,15 @@ DECLSPEC_IMPORT SECURITY_STATUS WINAPI SECUR32$FreeContextBuffer(PVOID);
 #define NMF_PREAMBLE_END 0x0C
 #define NMF_SIZED_ENVELOPE 0x06
 
+#ifndef SECPKG_ATTR_NEGOTIATION_INFO
+#define SECPKG_ATTR_NEGOTIATION_INFO 12
+#endif
+
+typedef struct _SecPkgContext_NegotiationInfoW {
+    PSecPkgInfoW PackageInfo;
+    unsigned long NegotiationState;
+} SecPkgContext_NegotiationInfoW;
+
 typedef struct CONNECTION_CONTEXT
 {
     SOCKET socket;
@@ -77,7 +86,7 @@ BOOL PerformNNSHandshake(CONNECTION_CONTEXT *ctx, const char *target)
     // Needs ADWS/ prefix for Kerberos
     char spnNarrow[512];
     MSVCRT$memset(targetSPN, 0, sizeof(targetSPN));
-    MSVCRT$sprintf(spnNarrow, "ADWS/%s", target);
+    MSVCRT$sprintf(spnNarrow, "ldap/%s", target);
     KERNEL32$MultiByteToWideChar(CP_UTF8, 0, spnNarrow, -1, targetSPN, 256);
 
     status = SECUR32$AcquireCredentialsHandleW(NULL, L"Negotiate", SECPKG_CRED_OUTBOUND, NULL, NULL, NULL, NULL,
@@ -156,7 +165,7 @@ BOOL PerformNNSHandshake(CONNECTION_CONTEXT *ctx, const char *target)
                 return FALSE;
             }
 
-            if (messageType != NNS_HANDSHAKE_IN_PROGRESS)
+            if (messageType != NNS_HANDSHAKE_IN_PROGRESS && messageType != NNS_HANDSHAKE_DONE)
             {
                 BeaconPrintf(CALLBACK_OUTPUT, "[-] Unexpected message type: 0x%02X\n", messageType);
                 intFree(recvBuffer);
@@ -178,28 +187,43 @@ BOOL PerformNNSHandshake(CONNECTION_CONTEXT *ctx, const char *target)
         recvBuffer = NULL;
     }
 
-    BYTE *doneBuffer = NULL;
-    DWORD doneSize = 0;
-    if (!NNSReceiveMessage(ctx->socket, &messageType, &doneBuffer, &doneSize))
-    {
-        return FALSE;
-    }
-
     if (messageType != NNS_HANDSHAKE_DONE)
     {
-        BeaconPrintf(CALLBACK_OUTPUT, "[-] Expected HANDSHAKE_DONE, got: 0x%02X\n", messageType);
+        BYTE *doneBuffer = NULL;
+        DWORD doneSize = 0;
+        if (!NNSReceiveMessage(ctx->socket, &messageType, &doneBuffer, &doneSize))
+        {
+            return FALSE;
+        }
+
+        if (messageType != NNS_HANDSHAKE_DONE)
+        {
+            BeaconPrintf(CALLBACK_OUTPUT, "[-] Expected HANDSHAKE_DONE, got: 0x%02X\n", messageType);
+            intFree(doneBuffer);
+            return FALSE;
+        }
+
         intFree(doneBuffer);
-        return FALSE;
     }
 
-    intFree(doneBuffer);
-
-    // Query context for sizes before encryption
     status = SECUR32$QueryContextAttributesW(&ctx->hContext, SECPKG_ATTR_SIZES, &ctx->sizes);
     if (status != SEC_E_OK)
     {
         BeaconPrintf(CALLBACK_OUTPUT, "[-] QueryContextAttributes failed: 0x%08X\n", status);
         return FALSE;
+    }
+
+    SecPkgContext_NegotiationInfoW negInfo;
+    MSVCRT$memset(&negInfo, 0, sizeof(negInfo));
+    status = SECUR32$QueryContextAttributesW(&ctx->hContext, SECPKG_ATTR_NEGOTIATION_INFO, &negInfo);
+    if (status == SEC_E_OK && negInfo.PackageInfo && negInfo.PackageInfo->Name)
+    {
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Authenticated (%S)\n", negInfo.PackageInfo->Name);
+        SECUR32$FreeContextBuffer(negInfo.PackageInfo);
+    }
+    else
+    {
+        BeaconPrintf(CALLBACK_OUTPUT, "[+] Authenticated\n");
     }
 
     BYTE preambleEnd = NMF_PREAMBLE_END;
@@ -308,29 +332,29 @@ BOOL NNSSendEncrypted(CONNECTION_CONTEXT *ctx, PBYTE data, DWORD dataLen)
     SecBufferDesc messageDesc;
     SecBuffer messageBuffers[3];
     SECURITY_STATUS status;
+    BYTE *workBuffer = NULL;
     BYTE *sendBuffer = NULL;
+    DWORD workLen;
     DWORD sendLen;
     int ret;
 
-    // Allocate buffer for encrypted data
-    sendLen = ctx->sizes.cbSecurityTrailer + dataLen + ctx->sizes.cbBlockSize;
-    sendBuffer = (BYTE *)intAlloc(sendLen + 4);
-    if (!sendBuffer)
+    workLen = ctx->sizes.cbSecurityTrailer + dataLen + ctx->sizes.cbBlockSize;
+    workBuffer = (BYTE *)intAlloc(workLen);
+    if (!workBuffer)
         return FALSE;
 
-    // Setup buffers
     messageBuffers[0].BufferType = SECBUFFER_TOKEN;
     messageBuffers[0].cbBuffer = ctx->sizes.cbSecurityTrailer;
-    messageBuffers[0].pvBuffer = sendBuffer + 4;
+    messageBuffers[0].pvBuffer = workBuffer;
 
     messageBuffers[1].BufferType = SECBUFFER_DATA;
     messageBuffers[1].cbBuffer = dataLen;
-    messageBuffers[1].pvBuffer = sendBuffer + 4 + ctx->sizes.cbSecurityTrailer;
+    messageBuffers[1].pvBuffer = workBuffer + ctx->sizes.cbSecurityTrailer;
     MSVCRT$memcpy(messageBuffers[1].pvBuffer, data, dataLen);
 
     messageBuffers[2].BufferType = SECBUFFER_PADDING;
     messageBuffers[2].cbBuffer = ctx->sizes.cbBlockSize;
-    messageBuffers[2].pvBuffer = sendBuffer + 4 + ctx->sizes.cbSecurityTrailer + dataLen;
+    messageBuffers[2].pvBuffer = workBuffer + ctx->sizes.cbSecurityTrailer + dataLen;
 
     messageDesc.ulVersion = SECBUFFER_VERSION;
     messageDesc.cBuffers = 3;
@@ -339,20 +363,37 @@ BOOL NNSSendEncrypted(CONNECTION_CONTEXT *ctx, PBYTE data, DWORD dataLen)
     status = SECUR32$EncryptMessage(&ctx->hContext, 0, &messageDesc, 0);
     if (status != SEC_E_OK)
     {
-        intFree(sendBuffer);
+        BeaconPrintf(CALLBACK_OUTPUT, "[-] EncryptMessage failed: 0x%08X\n", status);
+        intFree(workBuffer);
         return FALSE;
     }
 
-    // Calculate total encrypted size
     sendLen = messageBuffers[0].cbBuffer + messageBuffers[1].cbBuffer + messageBuffers[2].cbBuffer;
 
-    // Write length header (little-endian)
+    sendBuffer = (BYTE *)intAlloc(sendLen + 4);
+    if (!sendBuffer)
+    {
+        intFree(workBuffer);
+        return FALSE;
+    }
+
     sendBuffer[0] = (BYTE)(sendLen & 0xFF);
     sendBuffer[1] = (BYTE)((sendLen >> 8) & 0xFF);
     sendBuffer[2] = (BYTE)((sendLen >> 16) & 0xFF);
     sendBuffer[3] = (BYTE)((sendLen >> 24) & 0xFF);
 
+    DWORD offset = 4;
+    MSVCRT$memcpy(sendBuffer + offset, messageBuffers[0].pvBuffer, messageBuffers[0].cbBuffer);
+    offset += messageBuffers[0].cbBuffer;
+    MSVCRT$memcpy(sendBuffer + offset, messageBuffers[1].pvBuffer, messageBuffers[1].cbBuffer);
+    offset += messageBuffers[1].cbBuffer;
+    if (messageBuffers[2].cbBuffer > 0)
+    {
+        MSVCRT$memcpy(sendBuffer + offset, messageBuffers[2].pvBuffer, messageBuffers[2].cbBuffer);
+    }
+
     ret = WS2_32$send(ctx->socket, (char *)sendBuffer, sendLen + 4, 0);
+    intFree(workBuffer);
     intFree(sendBuffer);
 
     return (ret != SOCKET_ERROR);
