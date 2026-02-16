@@ -83,7 +83,6 @@ BOOL PerformNNSHandshake(CONNECTION_CONTEXT *ctx, const char *target)
     BYTE messageType;
     BOOL firstCall = TRUE;
 
-    // Needs ADWS/ prefix for Kerberos
     char spnNarrow[512];
     MSVCRT$memset(targetSPN, 0, sizeof(targetSPN));
     MSVCRT$sprintf(spnNarrow, "ldap/%s", target);
