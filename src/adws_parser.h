@@ -40,10 +40,12 @@ void OutputFlush(OutputBuffer *buf, DWORD objIdx);
 void internal_printf(const char *format, ...);
 void printoutput(BOOL done);
 
+#define ATTR_VALUE_BUFSIZE 65536
+
 typedef struct
 {
     char name[64];
-    char value[4096];
+    char value[ATTR_VALUE_BUFSIZE];
 } ATTRIBUTE_ENTRY;
 
 typedef struct
@@ -2035,7 +2037,7 @@ BOOL ParsePullResponse(BYTE *response, DWORD responseLen, const char *attrFilter
 
             if (nameCount > 0)
             {
-                char *attrValue = (char *)intAlloc(4096);
+                char *attrValue = (char *)intAlloc(ATTR_VALUE_BUFSIZE);
                 if (!attrValue)
                 {
                     BeaconPrintf(CALLBACK_ERROR, "[-] Failed to allocate memory for attribute value");
@@ -2045,11 +2047,11 @@ BOOL ParsePullResponse(BYTE *response, DWORD responseLen, const char *attrFilter
 
                 for (DWORD i = 0; i < nameCount; i++)
                 {
-                    MSVCRT$memset(attrValue, 0, 4096);
+                    MSVCRT$memset(attrValue, 0, ATTR_VALUE_BUFSIZE);
 
                     if (ExtractAttributeUniversal(response + boundaries[objIdx].start,
                                                   boundaries[objIdx].end - boundaries[objIdx].start, attributeNames[i],
-                                                  attrValue, 4096))
+                                                  attrValue, ATTR_VALUE_BUFSIZE))
                     {
                         OutputPrintf(&outBuf, "\n%s: %s", attributeNames[i], attrValue);
                     }

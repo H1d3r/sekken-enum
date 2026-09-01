@@ -129,7 +129,7 @@ void OutputInit(OutputBuffer *out)
     out->initialized = FALSE;
     if (g_useBeaconFormat)
     {
-        BeaconFormatAlloc(&out->buffer, 64 * 1024);
+        BeaconFormatAlloc(&out->buffer, 128 * 1024);
         out->initialized = TRUE;
     }
 }
@@ -137,22 +137,29 @@ void OutputInit(OutputBuffer *out)
 void OutputPrintf(OutputBuffer *out, const char *format, ...)
 {
     va_list args;
+    int needed;
+
     va_start(args, format);
+    needed = MSVCRT$vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    if (needed < 0)
+        needed = 4096;
+
+    char *temp = (char *)intAlloc(needed + 1);
+    if (!temp)
+        return;
+
+    va_start(args, format);
+    MSVCRT$vsnprintf(temp, needed + 1, format, args);
+    va_end(args);
 
     if (g_useBeaconFormat && out->initialized)
-    {
-        char temp[4096];
-        MSVCRT$vsnprintf(temp, sizeof(temp), format, args);
         BeaconFormatPrintf(&out->buffer, "%s", temp);
-    }
     else
-    {
-        char temp[4096];
-        MSVCRT$vsnprintf(temp, sizeof(temp), format, args);
         internal_printf("%s", temp);
-    }
 
-    va_end(args);
+    intFree(temp);
 }
 
 void OutputFlush(OutputBuffer *out, DWORD objIdx)
